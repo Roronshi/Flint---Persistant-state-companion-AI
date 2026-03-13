@@ -1,6 +1,22 @@
 # Flint
 
-**A local, decentralized companion bot that grows with you over time.**
+**A local AI companion that grows with you over time through persistent state and nightly fine-tuning. Early, incomplete, and entirely yours.**
+
+Flint is an attempt to build something that doesn't exist yet: a personal AI companion that lives on your machine, develops over time, and remains entirely yours.
+
+Most AI assistants reset with every conversation and recall everything with perfect fidelity. Flint aims for something different — something closer to how human memory actually works by help of using RWKV. 
+
+Flint won't remember every detail of what you said three months ago but if you have a tendency to talk about specific themes or perspectives it'll gradually adapt to being more in tune with you on these matters. 
+
+What Flint aims to do instead is to gradually become shaped by the sum of your shared history: the things you return to, the way you phrase things, the texture of how you relate. Less a searchable database, more a relationship that accumulates. 
+
+The underlying mechanism is RWKV — a recurrent model that carries genuine internal state rather than processing a context window from scratch each time. That state is saved to disk at the end of every session and restored at the start of the next. 
+
+Alongside that, Flint has the idea to run nightly LoRA fine-tuning on recent conversations mixed with older ones, slowly bending the model's character over weeks and months. The goal isn't a smarter assistant. It's a companion with a developing persona.
+
+Critically, all of this is designed to run on a personal computer. RWKV models are small enough that a modern consumer GPU can run inference comfortably, and the same is true of the nightly fine-tuning — LoRA training on a modest dataset fits within the kind of hardware people actually own. No cloud compute, no rented GPU, no subscription. The whole system — inference, memory, training — runs on the machine on your desk.
+
+This is early and incomplete. The architecture is in place — chat, state persistence, nightly training, conversation import, web UI — but real-world validation against a live model is still ahead. Nothing here is a promise. It's a direction.
 
 ## Current status
 
