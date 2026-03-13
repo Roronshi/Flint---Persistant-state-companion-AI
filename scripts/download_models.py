@@ -1,33 +1,33 @@
 #!/usr/bin/env python3
 """
-Download official RWKV‑7 G1 models from Hugging Face.
+Download official RWKV-7 G1 models from Hugging Face.
 
-This script uses the huggingface_hub API to fetch all available model
-weights from the repository ``BlinkDL/rwkv7-g1``.  By default the files
-are downloaded into the ``models`` directory within the Flint project.
-Only files ending in ``.pth`` or ``.onnx`` are downloaded.  Existing files
-will be skipped unless the ``--force`` flag is provided.
-
-Run this script before starting Flint to populate the models directory.
+Downloads only the LATEST file for the chosen size (sorted by filename,
+which encodes the release date as YYYYMMDD).  Uses huggingface-cli under
+the hood so downloads are resumable — if interrupted, re-running the
+script continues where it left off.
 
 Example::
 
-    python3 scripts/download_models.py
+    python3 scripts/download_models.py --size 2.9b
 
-Requires the ``huggingface_hub`` library.  Install with::
+Set HF_TOKEN in the environment (or pass --token) for faster, authenticated
+downloads:
+
+    HF_TOKEN=hf_xxx python3 scripts/download_models.py --size 2.9b
+
+Requires the ``huggingface_hub`` library::
 
     pip install huggingface_hub
-
-If you are downloading large models you may want to set the
-``HUGGINGFACE_HUB_TOKEN`` environment variable to your personal access
-token for authenticated downloads.
 """
 import argparse
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 try:
-    from huggingface_hub import hf_hub_download, list_repo_files
+    from huggingface_hub import list_repo_files
 except ImportError as exc:
     raise SystemExit(
         "huggingface_hub is required. Install with 'pip install huggingface_hub'."
@@ -38,79 +38,112 @@ REPO_ID = "BlinkDL/rwkv7-g1"
 DEFAULT_PATTERN = (".pth", ".onnx")
 
 
-def download_all_models(
-    repo: str = REPO_ID,
-    dest_dir: str = "models",
-    pattern: tuple[str, ...] = DEFAULT_PATTERN,
-    force: bool = False,
-    size: str | None = None,
-) -> None:
-    """Download model files matching ``pattern`` (and optionally ``size``) from ``repo``.
+def pick_latest(files: list) -> str:
+    """Return the lexicographically last filename — filenames encode YYYYMMDD."""
+    return sorted(files)[-1]
 
-    Parameters
-    ----------
-    repo: str
-        The Hugging Face repository to download from.
-    dest_dir: str
-        Destination directory where files will be saved.
-    pattern: tuple[str, ...]
-        File extensions to download (default: ``(".pth", ".onnx")``).
-    force: bool
-        If True, download and overwrite existing files.
-    size: str | None
-        If given, only download files whose filename contains this substring
-        (case-insensitive).  E.g. ``"1.5b"`` downloads only the 1.5B model.
-        Without this argument every matching file in the repo is downloaded.
-    """
+
+def download_model(
+    repo=REPO_ID,
+    dest_dir="models",
+    pattern=DEFAULT_PATTERN,
+    size=None,
+    token=None,
+    latest_only=True,
+):
     dest_path = Path(dest_dir)
     dest_path.mkdir(parents=True, exist_ok=True)
+
+    hf_token = token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+
     print(f"Listing files in repository {repo}…")
-    files = list_repo_files(repo)
-    model_files = [f for f in files if f.lower().endswith(pattern)]
-    if size:
-        model_files = [f for f in model_files if size.lower() in Path(f).name.lower()]
-    if not model_files:
-        msg = f"No model files found matching pattern"
+    list_kwargs = {}
+    if hf_token:
+        list_kwargs["token"] = hf_token
+    all_files = list(list_repo_files(repo, **list_kwargs))
+
+    candidates = [
+        f for f in all_files
+        if Path(f).suffix.lower() in pattern
+        and (not size or size.lower() in Path(f).name.lower())
+    ]
+
+    if not candidates:
+        msg = "No model files found"
         if size:
-            msg += f" and size '{size}'"
+            msg += f" matching size '{size}'"
         print(msg + ".")
-        return
-    print(f"Found {len(model_files)} model file(s):")
-    for f in model_files:
+        sys.exit(1)
+
+    to_download = [pick_latest(candidates)] if latest_only else candidates
+
+    print(f"{'Latest file' if latest_only else 'Files'} to download:")
+    for f in to_download:
         print(f"  {f}")
-    for f in model_files:
-        dest_file = dest_path / Path(f).name
-        if dest_file.exists() and not force:
-            print(f"Skipping existing file {dest_file}")
+
+    if not hf_token:
+        print()
+        print("  Tip: set HF_TOKEN for faster authenticated downloads.")
+        print("  huggingface.co → Settings → Access Tokens → New token (Read)")
+        print()
+
+    for filename in to_download:
+        dest_file = dest_path / Path(filename).name
+        if dest_file.exists():
+            print(f"Already exists, skipping: {dest_file.name}")
             continue
-        print(f"Downloading {f}…")
+
+        print(f"Downloading {filename}…")
+        cmd = [
+            sys.executable, "-m", "huggingface_hub.commands.huggingface_cli",
+            "download",
+            repo,
+            filename,
+            "--local-dir", str(dest_path),
+            "--local-dir-use-symlinks", "False",
+        ]
+        if hf_token:
+            cmd += ["--token", hf_token]
+
         try:
-            hf_hub_download(repo_id=repo, filename=f, cache_dir=str(dest_path), local_dir=str(dest_path), force_download=force)
-        except Exception as exc:
-            print(f"Failed to download {f}: {exc}")
+            subprocess.run(cmd, check=True)
+        except subprocess.CalledProcessError:
+            print("CLI download failed, falling back to hf_hub_download…")
+            from huggingface_hub import hf_hub_download
+            kwargs = dict(repo_id=repo, filename=filename, local_dir=str(dest_path))
+            if hf_token:
+                kwargs["token"] = hf_token
+            hf_hub_download(**kwargs)
+
+        if dest_file.exists():
+            print(f"Saved: {dest_file.name}")
         else:
-            print(f"Saved {dest_file}")
+            print(f"Warning: expected file not found at {dest_file}")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Download RWKV-7 G1 model weights from Hugging Face")
-    parser.add_argument("--repo", default=REPO_ID, help="Hugging Face repo id (default: BlinkDL/rwkv7-g1)")
-    parser.add_argument("--dest", default="models", help="Destination directory for model files (default: models)")
-    parser.add_argument(
-        "--pattern",
-        nargs="*",
-        default=DEFAULT_PATTERN,
-        help="File extensions to download (e.g. .pth .onnx).  Defaults to both .pth and .onnx",
+def main():
+    parser = argparse.ArgumentParser(
+        description="Download RWKV-7 G1 model weights from Hugging Face"
     )
-    parser.add_argument(
-        "--size",
-        default=None,
-        help="Only download files whose name contains this string (e.g. '1.5b', '7.2b').  "
-             "Omit to download all matching files.",
-    )
-    parser.add_argument("--force", action="store_true", help="Overwrite existing files")
+    parser.add_argument("--repo", default=REPO_ID)
+    parser.add_argument("--dest", default="models")
+    parser.add_argument("--pattern", nargs="*", default=list(DEFAULT_PATTERN))
+    parser.add_argument("--size", default=None,
+        help="Size filter e.g. '2.9b'. Downloads latest matching file only.")
+    parser.add_argument("--token", default=None,
+        help="HuggingFace access token (or set HF_TOKEN env var)")
+    parser.add_argument("--all", dest="all_versions", action="store_true",
+        help="Download all versions, not just the latest")
     args = parser.parse_args()
-    download_all_models(repo=args.repo, dest_dir=args.dest, pattern=tuple(args.pattern), force=args.force, size=args.size)
+
+    download_model(
+        repo=args.repo,
+        dest_dir=args.dest,
+        pattern=tuple(args.pattern),
+        size=args.size,
+        token=args.token,
+        latest_only=not args.all_versions,
+    )
 
 
 if __name__ == "__main__":
