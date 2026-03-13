@@ -12,4 +12,4 @@ override the defaults.
 MODEL_PATH = "dummy"
 
 # Use CPU for inference by default in test environment
-MODEL_STRATEGY = "cpu fp32"
+MODEL_STRATEGY = "cuda fp16"
