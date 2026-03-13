@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>RWKV Companion</title>
+<title>Flint</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Lora:ital,wght@0,400;0,500;1,400&family=JetBrains+Mono:wght@300;400&display=swap" rel="stylesheet">
 
@@ -82,9 +82,15 @@ body::before {
   border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
-  overflow: hidden;
+  overflow-y: auto;
+  overflow-x: hidden;
   position: relative;
 }
+
+#sidebar::-webkit-scrollbar { width: 4px; }
+#sidebar::-webkit-scrollbar-track { background: transparent; }
+#sidebar::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+#sidebar::-webkit-scrollbar-thumb:hover { background: var(--border-accent); }
 
 .sidebar-header {
   padding: 28px 24px 20px;
@@ -149,6 +155,23 @@ body::before {
   text-transform: uppercase;
   color: var(--text-dim);
   margin-bottom: 10px;
+  cursor: pointer;
+  user-select: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.section-label::before {
+  content: '▾';
+  font-size: 10px;
+  transition: transform 0.2s var(--ease);
+  flex-shrink: 0;
+}
+.sidebar-section.collapsed .section-label::before {
+  transform: rotate(-90deg);
+}
+.sidebar-section.collapsed .section-body {
+  display: none;
 }
 
 /* Stats grid */
@@ -920,7 +943,7 @@ body::before {
 
     <div class="sidebar-section">
       <div class="section-label">Session</div>
-      <div class="stats-grid">
+      <div class="section-body"><div class="stats-grid">
         <div class="stat-item">
           <div class="stat-value" id="stat-turns">0</div>
           <div class="stat-label">turns today</div>
@@ -949,15 +972,15 @@ body::before {
           <div class="stat-value" id="stat-tps">—</div>
           <div class="stat-label">avg speed</div>
         </div>
-      </div>
+      </div></div>
     </div>
 
     <div class="sidebar-section">
       <div class="section-label">LoRA</div>
-      <div class="lora-block" id="lora-block">
+      <div class="section-body"><div class="lora-block" id="lora-block">
         <div class="lora-label">Status</div>
         <span id="lora-status-text">loading...</span>
-      </div>
+      </div></div>
     </div>
 
     <div class="sidebar-section" id="model-section">
@@ -965,7 +988,7 @@ body::before {
         Model
         <button class="action-btn" id="btn-rescan" title="Rescan models directory" style="margin-left:auto;padding:2px 8px;font-size:10px">↺ Rescan</button>
       </div>
-      <div class="lora-block" id="model-info-block">
+      <div class="section-body"><div class="lora-block" id="model-info-block">
         <div class="lora-label">File</div>
         <span id="model-info-name" style="word-break:break-all">loading...</span>
         <div class="lora-label" style="margin-top:8px">Strategy</div>
@@ -992,13 +1015,13 @@ body::before {
         <div class="lora-label" style="margin-top:8px">Note</div>
         <span id="model-info-training-note" style="color:var(--text-dim)">Using LoRA fine‑tuning; advanced methods (QLoRA, state tuning) are experimental</span>
         <div id="model-load-error" style="display:none;margin-top:6px;font-size:10px;color:#e07070;word-break:break-all"></div>
-      </div>
+      </div></div>
     </div>
 
 
     <div class="sidebar-section" id="system-section">
       <div class="section-label">System</div>
-      <div class="lora-block" id="system-info-block">
+      <div class="section-body"><div class="lora-block" id="system-info-block">
         <div class="lora-label">Latest snapshot</div>
         <span id="system-latest-snapshot">—</span>
         <div class="lora-label" style="margin-top:8px">Reflection cycle</div>
@@ -1007,7 +1030,7 @@ body::before {
         <span id="system-idle-status">—</span>
         <div class="lora-label" style="margin-top:8px">LoRA last run</div>
         <span id="system-lora-last-run">—</span>
-      </div>
+      </div></div>
     </div>
 
     <!-- ── Outreach panel ─────────────────────────────────── -->
@@ -1016,15 +1039,15 @@ body::before {
         Companion thoughts
         <button class="action-btn" id="btn-reflect" title="Run reflection cycle now" style="margin-left:auto;padding:2px 8px;font-size:10px">↺ Reflect</button>
       </div>
-      <div id="outreach-list" style="display:flex;flex-direction:column;gap:6px;margin-top:8px">
+      <div class="section-body"><div id="outreach-list" style="display:flex;flex-direction:column;gap:6px;margin-top:8px">
         <div style="font-size:11px;color:var(--text-dim);font-style:italic">No pending thoughts.</div>
-      </div>
+      </div></div>
     </div>
 
     <!-- ── Initiative profile selector ───────────────────── -->
     <div class="sidebar-section" id="initiative-section">
       <div class="section-label">Initiative mode</div>
-      <div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:6px" id="initiative-btns"></div>
+      <div class="section-body"><div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:6px" id="initiative-btns"></div></div>
     </div>
 
     <div class="sidebar-section">
@@ -2167,8 +2190,18 @@ $('onboarding-import-file')?.addEventListener('change', async (e) => {
   } finally {
     e.target.value = '';
   }
-};
+});
 
+
+// Collapsible sidebar sections
+document.querySelectorAll('#sidebar .section-label').forEach(label => {
+  label.addEventListener('click', e => {
+    // Don't collapse if user clicked a button inside the label
+    if (e.target.closest('button')) return;
+    const section = label.closest('.sidebar-section');
+    if (section) section.classList.toggle('collapsed');
+  });
+});
 
 // On load, populate models
 document.addEventListener('DOMContentLoaded', loadModels);
