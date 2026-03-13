@@ -149,7 +149,7 @@ python main.py
 
 ## Importing existing conversations
 
-Export your ChatGPT or Claude history and feed it in as a starting point. The more data, the stronger the LoRA starting point.
+The aim for the system is to allow for the import your ChatGPT, Claude or other LLM history into Flint which gets feed this data as a starting point. The more data, the stronger the LoRA starting point.
 
 ```bash
 # ChatGPT (Settings → Export data → conversations.json)
