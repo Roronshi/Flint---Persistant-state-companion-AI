@@ -1,2 +1,237 @@
-# flint
-AI Companion that runs on your own machine. Talk to it via terminal or web browser. Remembers through persistent RWKV state. Gradually shaped by your shared conversations via automatic nightly LoRA fine-tuning. No cloud service, no subscription, no third party.
+# Flint
+
+**A local, decentralized companion bot that grows with you over time.**
+
+## Current status
+
+Flint is currently in **late pre-beta / early beta**. The main companion flow, model upload, chat import, snapshots, reflections, idle reasoning and G1-first onboarding are in place. The largest remaining technical risk is still **real-world validation of the ONNX path against an actual RWKV export**.
+
+
+Runs on your own machine. Talk to it via terminal or web browser. Remembers through persistent RWKV state. Gradually shaped by your shared conversations via automatic nightly LoRA fine-tuning. No cloud service, no subscription, no third party.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Joluck/flint/main/install.sh | bash
+```
+
+---
+
+## How it works
+
+RWKV is an RNN with transformer-level performance but constant memory usage — unlike transformers, it pays no growing cost for longer conversations. This makes it uniquely suited for long-term companion use.
+
+The project consists of three layers operating on different timescales:
+
+| Layer | What it is | Timescale |
+|---|---|---|
+| **RWKV State** | Active relationship memory — what is alive right now | Per session |
+| **LoRA Adapter** | Character formation — how the model fundamentally meets you | Weeks, months |
+| **SQLite log** | Exact conversation history, searchable, yours | Forever |
+
+State is saved to disk at the end of every session. Next time you open the chat, the model continues exactly where it left off — not through text reconstruction but through a genuinely stored mental state. LoRA runs automatically every night (03:00) on the day's conversations mixed with older ones (replay buffer), gradually bending the base weights toward how you communicate.
+
+---
+
+## Quick start
+
+### 1. Clone
+
+```bash
+git clone https://github.com/Joluck/flint
+cd flint
+```
+
+### 2. Install
+
+```bash
+bash install.sh
+```
+
+The script installs all Python dependencies, clones RWKV-PEFT, creates data directories, and guides you through the model download.
+
+### 3. Get a model
+
+There are now two normal ways to do this:
+
+1. Run `bash install.sh` and let Flint guide you toward an official **RWKV-7 G1** size.
+2. Or upload your own `.pth` or `.onnx` model directly from the web UI after startup.
+
+**Recommended official G1 sizes:**
+
+| Size | Best for |
+|---|---|
+| 0.1B | testing / very limited hardware |
+| 0.4B | lightweight laptops and CPUs |
+| 1.5B | balanced local use |
+| 2.9B | faster GPU-backed local use |
+| 7.2B | strongest local quality on high-end hardware |
+
+Custom models are allowed, but they are not the default recommendation.
+
+### 4. Configure
+
+
+```bash
+cp config.example.py config_local.py
+# Open config_local.py and set MODEL_PATH, USER_NAME, BOT_NAME
+```
+
+### 5. Start
+
+```bash
+# Web UI (recommended)
+uvicorn web.server:app --host 0.0.0.0 --port 8000
+
+# Terminal UI
+python main.py
+```
+
+Open `http://localhost:8000` in your browser.
+
+---
+
+## Web UI
+
+Clean, dark, fast. Tokens stream in real time. Sidebar with session statistics, full-text search across conversation history, and a manual LoRA trigger.
+
+Accessible from mobile via [Tailscale](https://tailscale.com):
+
+```bash
+uvicorn web.server:app --host 0.0.0.0 --port 8000
+# Open on mobile: http://<tailscale-ip>:8000
+```
+
+**Sidebar buttons:**
+
+| Button | Function |
+|---|---|
+| ◈ Save state | Save manually (also happens automatically every 5 turns) |
+| ⟳ Run LoRA now | Trigger training immediately without waiting until 03:00 |
+| ◌ Reset state | Start the relationship from scratch (log is preserved) |
+| Search field | Full-text search across the entire conversation history |
+
+---
+
+## Terminal UI
+
+```bash
+python main.py
+```
+
+**Commands:**
+
+```
+/status       — state, LoRA version, session statistics
+/save         — save state manually
+/reset        — reset state
+/search <q>   — search conversation history
+/lora now     — run LoRA training immediately
+/lora status  — show scheduler status
+/quit         — exit and save
+```
+
+---
+
+## Importing existing conversations
+
+Export your ChatGPT or Claude history and feed it in as a starting point. The more data, the stronger the LoRA starting point.
+
+```bash
+# ChatGPT (Settings → Export data → conversations.json)
+python tools/parser.py --source chatgpt --file ~/Downloads/conversations.json
+
+# Claude (Settings → Export)
+python tools/parser.py --source claude --file ~/Downloads/conversations.json
+
+# Preview without saving
+python tools/parser.py --source claude --file export.json --dry-run
+```
+
+---
+
+## LoRA — automatic character formation
+
+LoRA runs automatically every night at 03:00 if there are enough new conversations (default: at least 3). You won't notice — the bot is just a little more itself the next morning.
+
+**How it works:**
+
+1. Fetches sessions not yet trained on
+2. Mixes in 30% older sessions (replay buffer — prevents new training from erasing old character)
+3. Runs RWKV-PEFT training (~15–30 min on 12GB VRAM)
+4. Saves updated adapter, loaded at next session start
+
+**Configuration in `config_local.py`:**
+
+```python
+LORA_R          = 16      # Rank — higher = more dramatic change
+LORA_MIN_CONVOS = 3       # Don't train on fewer sessions than this
+REPLAY_RATIO    = 0.3     # 30% old conversations in each training batch
+LORA_SCHEDULE   = "03:00" # Nightly training time
+```
+
+---
+
+## Decentralized setup
+
+All data is stored locally. Sync `data/states/` and `data/lora_adapters/` with e.g. Syncthing to have the same companion across multiple devices. The base model only needs to exist on the server.
+
+```
+rwkv-companion/
+├── models/
+│   └── rwkv-7b.pth              # Base weights (~14GB)
+├── data/
+│   ├── states/{name}_state.pt   # Active relationship memory (~200MB)
+│   ├── lora_adapters/current.pth # Personal adapter (~100–200MB)
+│   └── conversations.db         # SQLite log
+└── config_local.py
+```
+
+---
+
+## Requirements
+
+| Component | Minimum | Recommended |
+|---|---|---|
+| Python | 3.10+ | 3.11 |
+| RAM | 16GB | 32GB+ |
+| VRAM | 8GB (Q8) | 12GB+ (fp16) |
+| Disk | 20GB | 50GB+ |
+| OS | Linux / macOS | Linux |
+
+---
+
+## Project structure
+
+```
+rwkv-companion/
+├── core/
+│   ├── model.py        # RWKV wrapper, state load/save, generation
+│   └── session.py      # SQLite log, session management
+├── lora/
+│   ├── pipeline.py     # LoRA training with replay buffer
+│   └── scheduler.py    # Nightly automatic training
+├── interface/
+│   └── terminal.py     # Terminal chat UI
+├── web/
+│   ├── server.py       # FastAPI + WebSocket backend
+│   └── static/
+│       └── index.html  # Complete web UI (single file)
+├── tools/
+│   └── parser.py       # Conversation import (ChatGPT / Claude)
+├── models/             # Place .pth files here
+├── data/               # State, adapters, SQLite — created automatically
+├── config.py           # Default configuration
+├── config.example.py   # Template for your configuration
+├── main.py             # Terminal UI entry point
+├── install.sh          # Installer script
+└── requirements.txt
+```
+
+---
+
+## License
+
+MIT
+
+## Beta candidate checklist
+
+See `BETA_CANDIDATE_CHECKLIST.md` for the concrete definition of what remains before Flint should be called a true beta candidate.

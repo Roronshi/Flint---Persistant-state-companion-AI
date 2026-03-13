@@ -1,0 +1,20 @@
+app-id: io.flint.Companion
+runtime: org.freedesktop.Platform
+runtime-version: '23.08'
+sdk: org.freedesktop.Sdk
+command: flint-launch
+finish-args:
+  - --share=network
+  - --filesystem=home
+modules:
+  - name: python3-deps
+    buildsystem: simple
+    build-commands:
+      - pip3 install --prefix=/app fastapi uvicorn python-multipart onnxruntime rwkv || true
+      - pip3 install --prefix=/app torch --index-url https://download.pytorch.org/whl/cpu || true
+  - name: flint
+    buildsystem: simple
+    build-commands:
+      - mkdir -p /app/flint
+      - cp -r . /app/flint/
+      - install -Dm755 /app/flint/scripts/flatpak-launch.sh /app/bin/flint-launch

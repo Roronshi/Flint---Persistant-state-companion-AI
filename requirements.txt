@@ -1,0 +1,19 @@
+# requirements.txt
+
+# RWKV core
+rwkv>=0.4.0
+
+# PyTorch — install manually with the correct CUDA version for your system:
+# https://pytorch.org/get-started/locally/
+# Example for CUDA 12.1:
+# pip install torch --index-url https://download.pytorch.org/whl/cu121
+torch>=2.0.0
+
+# Web backend
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+websockets>=12.0
+python-multipart>=0.0.9
+
+# Other
+numpy>=1.24.0
