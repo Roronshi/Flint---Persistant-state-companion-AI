@@ -15,7 +15,7 @@ This checklist defines when Flint can reasonably be called a beta candidate.
 - [x] Model list shows format, origin, readiness and size
 - [x] Official RWKV-7 G1 presets are recommended
 - [x] Custom models are allowed at the user's own risk
-- [ ] Real-world validation against at least one official G1 `.pth` model
+- [x] Real-world validation against at least one official G1 `.pth` model
 - [ ] Real-world validation against at least one RWKV ONNX export
 
 ## Training / persistence
