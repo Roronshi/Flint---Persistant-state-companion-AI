@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Flint</title>
+<title>RWKV Companion</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Lora:ital,wght@0,400;0,500;1,400&family=JetBrains+Mono:wght@300;400&display=swap" rel="stylesheet">
 
@@ -779,6 +779,51 @@ body::before {
   background: rgba(220,100,80,0.1);
 }
 
+/* ── Training overlay ───────────────────────────────────────────────────────── */
+#training-overlay {
+  position: absolute;
+  inset: 0;
+  background: var(--bg-base);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 24px;
+  z-index: 50;
+}
+.training-title {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.training-status {
+  font-size: 13px;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  min-height: 20px;
+}
+.training-bar-wrap {
+  width: 320px;
+  height: 3px;
+  background: var(--border);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.training-bar {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width 0.4s ease;
+  width: 0%;
+}
+.training-loss {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
 /* ── LoRA training badge ─────────────────────────────────────────────────────── */
 .lora-training-badge {
   display: flex;
@@ -1145,6 +1190,12 @@ body::before {
       </svg>
     </button>
 
+    <div id="training-overlay" style="display:none">
+      <div class="training-title">LoRA Training</div>
+      <div class="training-bar-wrap"><div class="training-bar" id="training-bar"></div></div>
+      <div class="training-status" id="training-status">Preparing...</div>
+      <div class="training-loss" id="training-loss"></div>
+    </div>
     <div id="messages">
       <div id="empty-state">
         <div class="empty-glyph">⟡</div>
@@ -1310,6 +1361,7 @@ function handleMessage(msg) {
       break;
 
     case 'done':
+      document.getElementById('training-overlay').style.display = 'none';
       updateGenerating(false);
       if (state.currentBotGroup) {
         finaliseGroup(state.currentBotGroup, msg);
@@ -1341,6 +1393,22 @@ function handleMessage(msg) {
     case 'busy':
       showToast(msg.message || 'Still generating…', 'warning');
       break;
+
+    case 'training': {
+      const overlay = document.getElementById('training-overlay');
+      const bar     = document.getElementById('training-bar');
+      const status  = document.getElementById('training-status');
+      const lossEl  = document.getElementById('training-loss');
+      if (!overlay) break;
+      overlay.style.display = 'flex';
+      const pct = msg.total_steps > 0
+        ? Math.round(((msg.epoch - 1) * msg.total_steps + msg.step) / (msg.epochs * msg.total_steps) * 100)
+        : 0;
+      bar.style.width = pct + '%';
+      status.textContent = `Epoch ${msg.epoch}/${msg.epochs} — step ${msg.step}/${msg.total_steps}`;
+      if (msg.loss) lossEl.textContent = `loss: ${msg.loss.toFixed(4)}`;
+      break;
+    }
 
     case 'pong':
       break;
