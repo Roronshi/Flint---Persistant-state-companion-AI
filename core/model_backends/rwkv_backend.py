@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
 import torch
 from typing import Callable, Optional
+
+log = logging.getLogger(__name__)
 
 import config
 from .base_backend import BaseModelBackend
@@ -48,29 +51,35 @@ class RWKVBackend(BaseModelBackend):
         # RWKV_x070 derives n_head/head_size internally from the r_k weight shape.
 
     def offload_to_cpu(self) -> None:
-        """Move model weights to CPU and free GPU memory. Used before LoRA subprocess."""
+        """Move model weights to CPU and free GPU memory. Used before LoRA training."""
         import gc
-        import torch
         if self.model is None:
             return
-        try:
-            # Move all tensors in model.z (RWKV-7) or model.w (older) to CPU
-            weight_dict = None
-            if hasattr(self.model, "z"):
-                weight_dict = self.model.z
-            elif hasattr(self.model, "w"):
-                weight_dict = self.model.w
-            if weight_dict is not None:
-                for k in weight_dict:
-                    if hasattr(weight_dict[k], "to"):
-                        weight_dict[k] = weight_dict[k].cpu()
-            # Also move state to CPU if present
-            if self.state is not None:
-                self.state = [s.cpu() if hasattr(s, "cpu") else s for s in self.state]
-        except Exception:
-            pass
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        weight_dict = None
+        if hasattr(self.model, "z"):
+            weight_dict = self.model.z
+        elif hasattr(self.model, "w"):
+            weight_dict = self.model.w
+        if weight_dict is not None:
+            moved = 0
+            for k in list(weight_dict.keys()):
+                v = weight_dict[k]
+                if isinstance(v, torch.Tensor) and v.is_cuda:
+                    weight_dict[k] = v.cpu()
+                    moved += 1
+            log.info("Offloaded %d weight tensors from GPU to CPU", moved)
+        if self.state is not None:
+            self.state = [
+                s.cpu() if (isinstance(s, torch.Tensor) and s.is_cuda) else s
+                for s in self.state
+            ]
         gc.collect()
         torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            allocated_gb = torch.cuda.memory_allocated() / 1e9
+            log.info("CUDA memory after offload: %.2f GB allocated", allocated_gb)
 
     def reload_to_gpu(self) -> None:
         """Reload model from disk back onto GPU after LoRA subprocess completes."""
@@ -170,9 +179,28 @@ class RWKVBackend(BaseModelBackend):
         torch.save(self.state, tmp)
         os.replace(tmp, path)
 
+    def _model_device(self) -> str:
+        """Return the device string of the loaded model weights (e.g. 'cuda:0' or 'cpu')."""
+        try:
+            z = self.model.z if hasattr(self.model, "z") else self.model.w
+            for v in z.values():
+                if isinstance(v, torch.Tensor):
+                    return str(v.device)
+        except Exception:
+            pass
+        return "cpu"
+
     def load_state(self, path: str) -> bool:
         if os.path.exists(path):
             self.state = torch.load(path, map_location="cpu", weights_only=False)
+            # Move state tensors to the model's device so forward() doesn't get a mismatch
+            if self.model is not None:
+                dev = self._model_device()
+                if dev != "cpu":
+                    self.state = [
+                        s.to(dev) if isinstance(s, torch.Tensor) else s
+                        for s in self.state
+                    ]
             return True
         self.state = None
         return False

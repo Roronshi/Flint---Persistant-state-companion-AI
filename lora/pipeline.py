@@ -178,6 +178,11 @@ class LoRAPipeline:
             except Exception as e:
                 log.warning(f"Adapter backup failed (continuing): {e}")
 
+        # Free VRAM so the training forward pass has room alongside the adapter weights
+        if hasattr(backend, "offload_to_cpu"):
+            log.info("Offloading inference model to CPU to free VRAM for training...")
+            backend.offload_to_cpu()
+
         try:
             trainer = RWKVLoRATrainer(
                 backend=backend,
@@ -207,3 +212,8 @@ class LoRAPipeline:
                 shutil.copy2(backup_path, adapter_path)
                 log.info("Restored previous adapter after training error.")
             return False
+        finally:
+            # Reload inference model back to GPU regardless of success/failure
+            if hasattr(backend, "reload_to_gpu"):
+                log.info("Reloading inference model to GPU...")
+                backend.reload_to_gpu()

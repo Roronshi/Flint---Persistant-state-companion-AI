@@ -6,6 +6,11 @@
 # Strategy: inject tiny LoRA matrices (A @ B) in parallel with the frozen
 # receptance/key/value/output projections in each attention block.
 # All base weights are frozen; only the adapter matrices are trained.
+#
+# Memory strategy: frozen weights live in CPU RAM (_cpu_z). The custom
+# _FrozenLinear / _AdapterLinear autograd Functions move each weight to GPU
+# for the matmul, then return it to CPU — it is never stored in the autograd
+# backward graph, so VRAM usage is dominated by small activations only.
 
 from __future__ import annotations
 
@@ -50,6 +55,66 @@ class LoRALinear(nn.Module):
         return {"lora_A": self.lora_A.data, "lora_B": self.lora_B.data}
 
 
+# ── Memory-efficient matmul helpers ───────────────────────────────────────────
+#
+# Standard autograd saves every weight tensor used in a matmul for backward
+# (to compute grad_input = grad_output @ W.T). For a 32-layer model this means
+# ~10 GB of VRAM just for saved weights. These custom Functions keep W on CPU
+# and re-fetch it during backward, so VRAM only holds small activations.
+
+class _FrozenLinear(torch.autograd.Function):
+    """y = x @ W_cpu  —  W_cpu stays on CPU; never stored in GPU autograd graph."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, W_cpu: torch.Tensor) -> torch.Tensor:
+        W = W_cpu.to(x.device, dtype=torch.float32)
+        y = x.float() @ W
+        ctx.save_for_backward(x, W_cpu)
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_y: torch.Tensor):
+        x, W_cpu = ctx.saved_tensors
+        W = W_cpu.to(grad_y.device, dtype=torch.float32)
+        grad_x = grad_y.float() @ W.t()
+        return grad_x, None  # no grad for W_cpu
+
+
+class _AdapterLinear(torch.autograd.Function):
+    """y = x @ (W_cpu + lora_B @ lora_A * scale)  —  W_cpu stays on CPU."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, W_cpu: torch.Tensor,
+                lora_B: torch.Tensor, lora_A: torch.Tensor,
+                scale: float) -> torch.Tensor:
+        dev = x.device
+        W = W_cpu.to(dev, dtype=torch.float32) + (lora_B.float() @ lora_A.float()) * scale
+        y = x.float() @ W
+        ctx.save_for_backward(x, W_cpu, lora_B, lora_A)
+        ctx.scale = scale
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_y: torch.Tensor):
+        x, W_cpu, lora_B, lora_A = ctx.saved_tensors
+        dev = grad_y.device
+        scale = ctx.scale
+        lB = lora_B.float()
+        lA = lora_A.float()
+        W = W_cpu.to(dev, dtype=torch.float32) + (lB @ lA) * scale
+        grad_y_f = grad_y.float()
+        # Gradient for x
+        grad_x = grad_y_f @ W.t()
+        # Gradients for lora_B and lora_A
+        # y = x @ (W_frozen + lB @ lA * scale)
+        # dL/d(lB) = (x.T @ grad_y) @ lA.T * scale   shape: [in, out] @ [out, r] = [in, r]
+        # dL/d(lA) = lB.T @ (x.T @ grad_y) * scale   shape: [r, in] @ [in, out] = [r, out]
+        grad_W = x.float().t() @ grad_y_f          # [in, out]
+        grad_lB = (grad_W @ lA.t()) * scale         # [in, r]
+        grad_lA = (lB.t() @ grad_W) * scale         # [r, out]
+        return grad_x, None, grad_lB, grad_lA, None
+
+
 # ── Trainer ───────────────────────────────────────────────────────────────────
 
 class RWKVLoRATrainer:
@@ -77,6 +142,7 @@ class RWKVLoRATrainer:
         epochs: int = 1,
         device: str = "cuda",
         dropout: float = 0.05,
+        max_seq_len: int = 64,
     ):
         self.backend = backend
         self.r = r
@@ -85,6 +151,7 @@ class RWKVLoRATrainer:
         self.epochs = epochs
         self.device = device
         self.dropout = dropout
+        self.max_seq_len = max_seq_len
         self._adapters: dict[str, LoRALinear] = {}
 
     # ── Adapter injection ─────────────────────────────────────────────────────
@@ -95,7 +162,6 @@ class RWKVLoRATrainer:
         backend       = RWKVBackend instance
         backend.model = RWKV_x070 instance  (RWKV-7 uses .z, older RWKV uses .w)
         """
-        # backend is RWKVBackend; the actual RWKV_x070 model is backend.model
         rwkv_model = getattr(self.backend, "model", None)
         if rwkv_model is not None and hasattr(rwkv_model, "z"):
             return rwkv_model.z  # RWKV_x070 (RWKV-7) stores weights in .z
@@ -116,6 +182,9 @@ class RWKVLoRATrainer:
             blocks.N.att.value.weight
             blocks.N.att.output.weight
 
+        Frozen weights remain in _cpu_z (CPU RAM). Only the trainable lora_A
+        and lora_B matrices are moved to self.device to avoid VRAM overhead.
+
         Also caches a CPU fp32 copy of all model weights once so that
         _forward_for_training avoids repeated CUDA→CPU copies per step.
         """
@@ -134,18 +203,21 @@ class RWKVLoRATrainer:
                 and parts[4] == "weight"
             ):
                 name = ".".join(parts[:4])
+                # Create adapter with weight on CPU — only lora_A/lora_B go to device
                 lora = LoRALinear(
-                    tensor.float().cpu(),  # fp32 on CPU for training
+                    tensor.float().cpu(),
                     r=self.r,
                     alpha=self.alpha,
                     dropout=self.dropout,
-                ).to("cpu")
+                )
+                lora.lora_A = nn.Parameter(lora.lora_A.to(self.device))
+                lora.lora_B = nn.Parameter(lora.lora_B.to(self.device))
                 self._adapters[name] = lora
                 log.debug("Injected LoRA adapter: %s", key)
 
         log.info("Injected %d LoRA adapters", len(self._adapters))
 
-        # Cache all model tensors on CPU (fp32) once — avoids per-step GPU→CPU copies
+        # Cache all model tensors on CPU (fp32) once
         log.info("Caching model weights on CPU for training...")
         self._cpu_z: dict = {}
         for key, tensor in weight_dict.items():
@@ -153,31 +225,37 @@ class RWKVLoRATrainer:
                 self._cpu_z[key] = tensor.float().cpu()
         log.info("Weight cache ready (%d tensors)", len(self._cpu_z))
 
-    def _w(self, key: str) -> torch.Tensor:
-        """Return CPU fp32 weight for key, using LoRA-merged version if available."""
+    def _mm(self, x: torch.Tensor, key: str) -> torch.Tensor:
+        """
+        Compute x @ W[key], keeping W on CPU for the autograd backward pass.
+        Applies the LoRA delta if an adapter exists for this weight.
+        """
         name = key[:-7] if key.endswith(".weight") else key
-        if name in self._adapters:
-            return self._adapters[name].merged_weight()
-        return self._cpu_z[key]
+        lora = self._adapters.get(name)
+        if lora is not None:
+            return _AdapterLinear.apply(x, self._cpu_z[key], lora.lora_B, lora.lora_A, lora.scale)
+        return _FrozenLinear.apply(x, self._cpu_z[key])
 
-    # ── Forward pass (gradient-enabled, CPU) ─────────────────────────────────
+    # ── Forward pass (gradient-enabled, memory-efficient) ────────────────────
 
     def _forward_for_training(self, token_ids: List[int]) -> torch.Tensor:
         """
-        Gradient-enabled forward pass for RWKV-7 G1 running on CPU.
+        Gradient-enabled forward pass for RWKV-7 G1.
 
         Mirrors forward_seq from rwkv.model but without torch.no_grad(), so
         that gradients flow through the LoRA-merged attention weight matrices.
-        Uses pre-cached CPU fp32 weights from self._cpu_z to avoid repeated
-        CUDA→CPU copies.
+
+        Frozen weights are accessed via _mm() which uses _FrozenLinear /
+        _AdapterLinear to prevent them from being stored in the autograd graph.
+        This keeps VRAM usage low (only small activations accumulate).
 
         Returns logits of shape (T, vocab_size).
         """
         model = self.backend.model
         H, N = model.n_head, model.head_size
-        dev = "cpu"  # always train on CPU — VRAM is occupied by inference model
+        dev = self.device
 
-        # Initialise state (float32, matches what generate_zero_state uses)
+        # Initialise RNN state tensors — fp32 for numerical accuracy
         n_embd = model.n_embd
         n_layer = model.n_layer
         state_tmix_prev = [
@@ -193,11 +271,10 @@ class RWKVLoRATrainer:
             for _ in range(n_layer)
         ]
 
-        # Shorthand: c = self._cpu_z (pre-cached CPU fp32 weights)
         c = self._cpu_z
 
-        # Embedding lookup (already layer-normed at model load time)
-        x = c['emb.weight'][token_ids]  # (T, n_embd), CPU fp32
+        # Embedding lookup: index into CPU tensor, move result to device
+        x = c['emb.weight'][token_ids].to(dev)  # (T, n_embd), fp32
         T = x.shape[0]
 
         v_first = torch.zeros_like(x)
@@ -209,29 +286,32 @@ class RWKVLoRATrainer:
 
             # ── Time-mix (attention) ─────────────────────────────────────────
             xx_ln = F.layer_norm(x, (n_embd,),
-                                 weight=c[bbb+'ln1.weight'],
-                                 bias=c[bbb+'ln1.bias'])
+                                 weight=c[bbb+'ln1.weight'].to(dev),
+                                 bias=c[bbb+'ln1.bias'].to(dev))
 
             sx = torch.cat((state_tmix_prev[i].unsqueeze(0), xx_ln[:-1, :]))
             shift = sx - xx_ln
 
-            xr = xx_ln + shift * c[att+'x_r'].squeeze()
-            xw = xx_ln + shift * c[att+'x_w'].squeeze()
-            xk = xx_ln + shift * c[att+'x_k'].squeeze()
-            xv = xx_ln + shift * c[att+'x_v'].squeeze()
-            xa = xx_ln + shift * c[att+'x_a'].squeeze()
-            xg = xx_ln + shift * c[att+'x_g'].squeeze()
+            xr = xx_ln + shift * c[att+'x_r'].squeeze().to(dev)
+            xw = xx_ln + shift * c[att+'x_w'].squeeze().to(dev)
+            xk = xx_ln + shift * c[att+'x_k'].squeeze().to(dev)
+            xv = xx_ln + shift * c[att+'x_v'].squeeze().to(dev)
+            xa = xx_ln + shift * c[att+'x_a'].squeeze().to(dev)
+            xg = xx_ln + shift * c[att+'x_g'].squeeze().to(dev)
 
-            r = xr @ self._w(att+'receptance.weight')
-            w = torch.tanh(xw @ c[att+'w1']) @ c[att+'w2']
-            k = xk @ self._w(att+'key.weight')
-            v = xv @ self._w(att+'value.weight')
-            a = torch.sigmoid(c[att+'a0'] + (xa @ c[att+'a1']) @ c[att+'a2'])
-            g = torch.sigmoid(xg @ c[att+'g1']) @ c[att+'g2']
+            # All 2D weight matmuls go through _mm() to keep W on CPU for backward
+            r = self._mm(xr, att+'receptance.weight')
+            w = torch.tanh(self._mm(xw, att+'w1'))
+            w = self._mm(w, att+'w2')
+            k = self._mm(xk, att+'key.weight')
+            v = self._mm(xv, att+'value.weight')
+            a = torch.sigmoid(c[att+'a0'].to(dev) + self._mm(self._mm(xa, att+'a1'), att+'a2'))
+            g = torch.sigmoid(self._mm(xg, att+'g1'))
+            g = self._mm(g, att+'g2')
 
-            k_k = c[att+'k_k'].squeeze()
-            k_a = c[att+'k_a'].squeeze()
-            r_k = c[att+'r_k']
+            k_k = c[att+'k_k'].squeeze().to(dev)
+            k_a = c[att+'k_a'].squeeze().to(dev)
+            r_k = c[att+'r_k'].to(dev)
 
             kk = F.normalize((k * k_k).view(T, H, N), dim=-1, p=2.0).view(T, H * N)
             k  = k * (1 + (a - 1) * k_a)
@@ -240,57 +320,58 @@ class RWKVLoRATrainer:
                 v_first = v
             else:
                 v = v + (v_first - v) * torch.sigmoid(
-                    c[att+'v0'] + (xv @ c[att+'v1']) @ c[att+'v2']
+                    c[att+'v0'].to(dev) + self._mm(self._mm(xv, att+'v1'), att+'v2')
                 )
 
-            decay_w = torch.exp(-0.606531 * torch.sigmoid(c[att+'w0'] + w))
+            decay_w = torch.exp(-0.606531 * torch.sigmoid(c[att+'w0'].to(dev) + w))
 
             state = state_tmix_wkv[i]
-            xx_out = torch.zeros(T, H * N, dtype=torch.float32)
+            xx_out = torch.zeros(T, H * N, dtype=torch.float32, device=dev)
             for t in range(T):
                 r_, w_, k_, v_, kk_, a_ = r[t], decay_w[t], k[t], v[t], kk[t], a[t]
-                vk = v_.view(H, N, 1) @ k_.view(H, 1, N)
-                ab = (-kk_).view(H, N, 1) @ (kk_ * a_).view(H, 1, N)
-                state = state * w_.view(H, 1, N) + state @ ab + vk
-                xx_out[t] = (state @ r_.view(H, N, 1)).view(H * N)
+                vk = v_.float().view(H, N, 1) @ k_.float().view(H, 1, N)
+                ab = (-kk_).float().view(H, N, 1) @ (kk_ * a_).float().view(H, 1, N)
+                s_prev = state.detach()
+                state = s_prev * w_.float().view(H, 1, N) + s_prev @ ab + vk
+                xx_out[t] = (state @ r_.float().view(H, N, 1)).view(H * N)
 
             state_tmix_wkv[i] = state.detach()
-            state_tmix_prev[i] = xx_ln[-1, :].detach()
+            state_tmix_prev[i] = xx_ln[-1, :].float().detach()
 
             xx_out = F.group_norm(xx_out.view(T, H * N), num_groups=H,
-                                  weight=c[att+'ln_x.weight'],
-                                  bias=c[att+'ln_x.bias'],
+                                  weight=c[att+'ln_x.weight'].to(dev),
+                                  bias=c[att+'ln_x.bias'].to(dev),
                                   eps=64e-5).view(T, H * N)
             rk_term = ((r * k * r_k).view(T, H, N).sum(dim=-1, keepdim=True) * v.view(T, H, N)).view(T, H * N)
             xx_out = xx_out + rk_term
-            att_out = (xx_out * g) @ self._w(att+'output.weight')
+            att_out = self._mm(xx_out * g, att+'output.weight')
             x = x + att_out
 
             # ── Channel-mix (FFN) ────────────────────────────────────────────
             xx_ln2 = F.layer_norm(x, (n_embd,),
-                                  weight=c[bbb+'ln2.weight'],
-                                  bias=c[bbb+'ln2.bias'])
+                                  weight=c[bbb+'ln2.weight'].to(dev),
+                                  bias=c[bbb+'ln2.bias'].to(dev))
 
             sx2 = torch.cat((state_cmix_prev[i].unsqueeze(0), xx_ln2[:-1, :]))
-            k_ffn = xx_ln2 + (sx2 - xx_ln2) * c[ffn+'x_k'].squeeze()
-            k_ffn = torch.relu(k_ffn @ c[ffn+'key.weight']) ** 2
-            ffn_out = k_ffn @ c[ffn+'value.weight']
-            state_cmix_prev[i] = xx_ln2[-1, :].detach()
+            k_ffn = xx_ln2 + (sx2 - xx_ln2) * c[ffn+'x_k'].squeeze().to(dev)
+            k_ffn = torch.relu(self._mm(k_ffn, ffn+'key.weight')) ** 2
+            ffn_out = self._mm(k_ffn, ffn+'value.weight')
+            state_cmix_prev[i] = xx_ln2[-1, :].float().detach()
             x = x + ffn_out
 
-        x = F.layer_norm(x, (n_embd,), weight=c['ln_out.weight'], bias=c['ln_out.bias'])
-        logits = x @ c['head.weight']
+        x = F.layer_norm(x, (n_embd,), weight=c['ln_out.weight'].to(dev), bias=c['ln_out.bias'].to(dev))
+        logits = self._mm(x, 'head.weight')
         return logits  # (T, vocab_size)
 
     # ── Loss ──────────────────────────────────────────────────────────────────
 
     def _compute_loss(self, token_ids: List[int]) -> torch.Tensor:
         if len(token_ids) < 2:
-            return torch.tensor(0.0, requires_grad=True)  # training always runs on CPU
+            return torch.tensor(0.0, requires_grad=True, device=self.device)
         logits = self._forward_for_training(token_ids)  # (T, vocab)
         # Predict next token: input[:-1] → target[1:]
         shift_logits = logits[:-1]
-        shift_labels = torch.tensor(token_ids[1:], dtype=torch.long)
+        shift_labels = torch.tensor(token_ids[1:], dtype=torch.long, device=self.device)
         return F.cross_entropy(shift_logits, shift_labels)
 
     # ── Tokenise training segments ───────────────────────────────────────────
@@ -342,6 +423,7 @@ class RWKVLoRATrainer:
             epoch_loss = 0.0
             total_seq = len(token_seqs)
             for step_i, ids in enumerate(token_seqs):
+                ids = ids[:self.max_seq_len]
                 optimizer.zero_grad()
                 loss = self._compute_loss(ids)
                 if loss.requires_grad:
@@ -370,7 +452,6 @@ class RWKVLoRATrainer:
     def save_adapter(self, path: str):
         """Save adapter matrices to a .pt file."""
         state = {name: lora.adapter_state() for name, lora in self._adapters.items()}
-        # Ensure output directory exists
         import os as _os
         _os.makedirs(_os.path.dirname(path) if _os.path.dirname(path) else ".", exist_ok=True)
         meta = {"r": self.r, "alpha": self.alpha, "version": 1}
