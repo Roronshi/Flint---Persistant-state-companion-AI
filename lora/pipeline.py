@@ -187,21 +187,35 @@ class LoRAPipeline:
             except Exception as e:
                 log.warning(f"Adapter backup failed (continuing): {e}")
 
+        import json as _json
+        lora_config = _json.dumps({
+            "r": config.LORA_R,
+            "alpha": config.LORA_ALPHA,
+            "dropout": 0.0,
+            "parts": ["att", "ffn"],
+        })
         cmd = [
             python_exe, str(peft_train),
-            f"--model_path={config.MODEL_PATH}",
+            f"--load_model={config.MODEL_PATH}",
             f"--data_file={data_path}",
-            f"--lora_r={config.LORA_R}",
-            f"--lora_alpha={config.LORA_ALPHA}",
-            f"--output_path={adapter_path}",
-            f"--epochs={config.LORA_EPOCHS}",
-            f"--lr={config.LORA_LR}",
+            f"--proj_dir={str(Path(adapter_path).parent)}",
+            f"--epoch_count={config.LORA_EPOCHS}",
+            "--epoch_save=1",
+            f"--lr_init={config.LORA_LR}",
+            f"--lr_final={config.LORA_LR}",
             "--train_type=lora",
+            f"--lora_config={lora_config}",
+            "--data_type=jsonl",
+            "--ctx_len=512",
+            "--micro_bsz=1",
+            "--accumulate_grad_batches=4",
+            "--devices=1",
+            "--precision=bf16",
         ]
 
         # Accumulative training from the previous adapter
         if os.path.exists(adapter_path):
-            cmd.append(f"--load_adapter={adapter_path}")
+            cmd.append(f"--peft_config={adapter_path}")
 
         try:
             result = subprocess.run(
