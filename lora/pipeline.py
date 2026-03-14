@@ -157,17 +157,24 @@ class LoRAPipeline:
 
     def _run_peft_training(self, segments: list, backend=None) -> bool:
         """
-        Fine-tune using the built-in RWKVLoRATrainer (no subprocess, no deepspeed).
-        backend is the live RWKVBackend instance from the running model.
+        Fine-tune by running lora/trainer.py as a subprocess with RWKV_JIT_ON=0.
+        This lets the main process keep JIT enabled for fast inference while the
+        trainer subprocess loads the model fresh without JIT so .w is accessible.
         """
-        if backend is None:
-            log.error("No backend provided to _run_peft_training — skipping.")
-            return False
-
-        from lora.trainer import RWKVLoRATrainer
+        import subprocess as _subprocess
+        import sys as _sys
 
         adapter_path = config.LORA_ADAPTER
         backup_path  = adapter_path + ".bak"
+        project_root = Path(config.BASE_DIR)
+        trainer_script = project_root / "lora" / "trainer.py"
+        venv_python = project_root / ".venv" / "bin" / "python3"
+        python_exe = str(venv_python) if venv_python.exists() else _sys.executable
+
+        # Strip .pth suffix — RWKV_x070 appends it internally
+        model_path = config.MODEL_PATH
+        if model_path.endswith(".pth"):
+            model_path = model_path[:-4]
 
         # Back up existing adapter
         if os.path.exists(adapter_path):
@@ -176,29 +183,51 @@ class LoRAPipeline:
             except Exception as e:
                 log.warning(f"Adapter backup failed (continuing): {e}")
 
+        # Write segments to a temp JSONL file
+        fd, tmpfile = tempfile.mkstemp(suffix=".jsonl")
         try:
-            trainer = RWKVLoRATrainer(
-                backend=backend,
-                r=config.LORA_R,
-                alpha=config.LORA_ALPHA,
-                lr=config.LORA_LR,
-                epochs=getattr(config, "LORA_EPOCHS", 1),
-                device="cuda" if "cuda" in config.MODEL_STRATEGY else "cpu",
-                dropout=0.05,
+            os.close(fd)
+            self.write_jsonl(segments, tmpfile)
+
+            cmd = [
+                python_exe, str(trainer_script),
+                "--model",       model_path,
+                "--strategy",    config.MODEL_STRATEGY,
+                "--data",        tmpfile,
+                "--adapter_out", adapter_path,
+                "--r",           str(config.LORA_R),
+                "--alpha",       str(config.LORA_ALPHA),
+                "--lr",          str(config.LORA_LR),
+                "--epochs",      str(getattr(config, "LORA_EPOCHS", 1)),
+            ]
+            if os.path.exists(adapter_path):
+                cmd += ["--adapter_in", adapter_path]
+
+            env = os.environ.copy()
+            env["RWKV_JIT_ON"] = "0"   # must be off so model.w is accessible
+            env["RWKV_V7_ON"]  = "1"
+            env["RWKV_CUDA_ON"] = "0"
+
+            log.info("Launching trainer subprocess...")
+            result = _subprocess.run(
+                cmd,
+                env=env,
+                capture_output=False,
+                timeout=7200,
             )
-            result = trainer.train(segments)
-            if "error" in result:
-                log.error("Trainer error: %s", result["error"])
+            if result.returncode != 0:
+                if os.path.exists(backup_path):
+                    shutil.copy2(backup_path, adapter_path)
+                    log.info("Restored previous adapter after failed training run.")
                 return False
-            trainer.save_adapter(adapter_path)
-            log.info(
-                "LoRA training complete — loss: %.4f, steps: %d, time: %.1fs",
-                result["loss"], result["steps"], result["elapsed"],
-            )
             return True
-        except Exception as exc:
-            log.error("LoRA training failed: %s", exc, exc_info=True)
-            if os.path.exists(backup_path):
-                shutil.copy2(backup_path, adapter_path)
-                log.info("Restored previous adapter after training error.")
+
+        except _subprocess.TimeoutExpired:
+            log.error("LoRA training timed out after 2 hours.")
             return False
+        except Exception as exc:
+            log.error("LoRA subprocess error: %s", exc, exc_info=True)
+            return False
+        finally:
+            if os.path.exists(tmpfile):
+                os.unlink(tmpfile)
