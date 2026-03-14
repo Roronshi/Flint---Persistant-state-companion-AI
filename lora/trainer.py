@@ -108,12 +108,18 @@ class RWKVLoRATrainer:
     def _get_weight_dict(self):
         """
         Return a flat {name: tensor} dict from the model.
-        RWKV_x070 stores weights in model.w (OrderedDict of tensors).
+        backend       = RWKVBackend instance
+        backend.model = RWKV_x070 instance  (has .w)
         """
-        model = self.backend.model
-        if hasattr(model, "w"):
-            return model.w  # direct reference — mutations affect the model
-        raise RuntimeError("Cannot access model weights: model has no .w attribute")
+        # backend is RWKVBackend; the actual RWKV_x070 model is backend.model
+        rwkv_model = getattr(self.backend, "model", None)
+        if rwkv_model is not None and hasattr(rwkv_model, "w"):
+            return rwkv_model.w  # direct reference — mutations affect the model
+        raise RuntimeError(
+            f"Cannot access model weights: "
+            f"backend={type(self.backend).__name__} "
+            f"backend.model={type(rwkv_model).__name__ if rwkv_model else 'None'}"
+        )
 
     def _inject_adapters(self):
         """Build LoRALinear adapters for target attention projection weights.
@@ -160,8 +166,8 @@ class RWKVLoRATrainer:
         Run a stateless forward pass, temporarily patching weights with merged
         LoRA deltas. Works with both .w dict and TorchScript state_dict.
         """
-        model = self.backend.model
-        w = self._weight_dict
+        model = self.backend.model  # RWKV_x070 instance
+        w = self._weight_dict        # = model.w (direct reference)
 
         # Build merged weights and patch (keys always have .weight suffix)
         original = {}
