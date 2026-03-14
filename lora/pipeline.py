@@ -208,13 +208,25 @@ class LoRAPipeline:
             env["RWKV_V7_ON"]  = "1"
             env["RWKV_CUDA_ON"] = "0"
 
+            # Offload main model to CPU to free VRAM for the trainer subprocess
+            if backend is not None and hasattr(backend, "offload_to_cpu"):
+                log.info("Offloading main model to CPU to free VRAM...")
+                backend.offload_to_cpu()
+
             log.info("Launching trainer subprocess...")
-            result = _subprocess.run(
-                cmd,
-                env=env,
-                capture_output=False,
-                timeout=7200,
-            )
+            try:
+                result = _subprocess.run(
+                    cmd,
+                    env=env,
+                    capture_output=False,
+                    timeout=7200,
+                )
+            finally:
+                # Always reload model back to GPU
+                if backend is not None and hasattr(backend, "reload_to_gpu"):
+                    log.info("Reloading main model to GPU...")
+                    backend.reload_to_gpu()
+
             if result.returncode != 0:
                 if os.path.exists(backup_path):
                     shutil.copy2(backup_path, adapter_path)
