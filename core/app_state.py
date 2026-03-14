@@ -22,6 +22,8 @@ class AppState:
     total_elapsed: float = 0.0
     companion_id: Optional[str] = None
     active_model_id: Optional[str] = None
+    training_active: bool = False
+    training_progress: dict = field(default_factory=dict)  # epoch/step/total/loss
 
     @property
     def avg_tokens_per_second(self) -> float:
