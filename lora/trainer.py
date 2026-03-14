@@ -302,3 +302,85 @@ class RWKVLoRATrainer:
         except Exception as exc:
             log.error("Failed to load adapter: %s", exc)
             return False
+
+
+# ── CLI entry point (called as subprocess by pipeline.py) ────────────────────
+
+if __name__ == "__main__":
+    import os
+    import sys
+    import json
+    import argparse
+    import logging
+
+    # JIT must be off before rwkv.model is imported
+    os.environ["RWKV_JIT_ON"] = "0"
+    os.environ.setdefault("RWKV_V7_ON", "1")
+    os.environ.setdefault("RWKV_CUDA_ON", "0")
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    parser = argparse.ArgumentParser(description="Flint LoRA trainer")
+    parser.add_argument("--model",       required=True,  help="Path to .pth model (without extension)")
+    parser.add_argument("--strategy",    default="cuda fp16")
+    parser.add_argument("--data",        required=True,  help="Path to JSONL training file")
+    parser.add_argument("--adapter_out", required=True,  help="Where to save the adapter .pt file")
+    parser.add_argument("--r",           type=int,   default=16)
+    parser.add_argument("--alpha",       type=int,   default=32)
+    parser.add_argument("--lr",          type=float, default=1e-4)
+    parser.add_argument("--epochs",      type=int,   default=1)
+    parser.add_argument("--adapter_in",  default="",     help="Existing adapter to continue from")
+    args = parser.parse_args()
+
+    from rwkv.model import RWKV_x070 as RWKV
+    from rwkv.utils import PIPELINE
+
+    log.info("Loading model: %s (%s)", args.model, args.strategy)
+    model = RWKV(model=args.model, strategy=args.strategy)
+    pipeline = PIPELINE(model, "rwkv_vocab_v20230424")
+
+    # Load training data
+    segments = []
+    with open(args.data, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                segments.append(json.loads(line))
+    log.info("Loaded %d segments from %s", len(segments), args.data)
+
+    # Simple backend shim so RWKVLoRATrainer can access model.w
+    class _Backend:
+        def __init__(self, m, p):
+            self.model = m
+            self.pipeline = p
+
+    backend = _Backend(model, pipeline)
+    device = "cuda" if "cuda" in args.strategy else "cpu"
+
+    trainer = RWKVLoRATrainer(
+        backend=backend,
+        r=args.r,
+        alpha=args.alpha,
+        lr=args.lr,
+        epochs=args.epochs,
+        device=device,
+        dropout=0.05,
+    )
+
+    # Load existing adapter if provided
+    if args.adapter_in and os.path.exists(args.adapter_in):
+        log.info("Loading existing adapter: %s", args.adapter_in)
+        RWKVLoRATrainer.load_adapter(backend, args.adapter_in)
+
+    result = trainer.train(segments)
+    if "error" in result:
+        log.error("Training error: %s", result["error"])
+        sys.exit(1)
+
+    trainer.save_adapter(args.adapter_out)
+    log.info("Done — loss=%.4f steps=%d elapsed=%.1fs", result["loss"], result["steps"], result["elapsed"])
+    sys.exit(0)
