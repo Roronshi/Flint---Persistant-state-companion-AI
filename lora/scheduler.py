@@ -27,7 +27,7 @@ class LoRAScheduler:
 
     def __init__(self, db: ConversationDB):
         self.db         = db
-        self.pipeline   = LoRAPipeline(db)
+        self.pipeline   = LoRAPipeline(db, backend=None)  # backend set later via set_backend()
         self._thread: threading.Thread = None
         self._stop_event = threading.Event()
         self.last_run: Optional[datetime] = self._load_last_run()
@@ -54,6 +54,10 @@ class LoRAScheduler:
             log.warning(f"Could not persist last_run: {e}")
 
     # ── Control ────────────────────────────────────────────────────────────────
+
+    def set_backend(self, backend):
+        """Attach the live model backend so the trainer can access model weights."""
+        self.pipeline._backend = backend
 
     def start(self):
         self._thread = threading.Thread(
