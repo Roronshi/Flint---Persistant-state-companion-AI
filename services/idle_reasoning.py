@@ -12,7 +12,7 @@ log = logging.getLogger(__name__)
 
 
 class IdleReasoningService:
-    """Generates reflection candidates via model reasoning when available."""
+    """Generates conversation-keeping questions from recent shared history."""
 
     def __init__(self, db: ConversationDB, model: CompanionModel, reflection_service: ReflectionService):
         self.db = db
@@ -28,27 +28,44 @@ class IdleReasoningService:
         return {"summaries": summaries, "memories": memories, "open_loops": open_loops[:10]}
 
     def _prompt_from_context(self, bundle: Dict[str, Any]) -> str:
-        summaries_txt = "\n".join(f"- {row['summary_text']}" for row in bundle["summaries"])
-        memories_txt = "\n".join(f"- {row['title']}: {row['content']}" for row in bundle["memories"])
-        loops_txt = "\n".join(f"- {item}" for item in bundle["open_loops"])
+        # Pull out the most recent summary texts and open loops as topic hints.
+        summary_lines = [row["summary_text"] for row in bundle["summaries"] if row.get("summary_text")]
+        loop_lines = [item for item in bundle["open_loops"] if item]
+
+        topics: List[str] = []
+        topics.extend(summary_lines[:3])
+        topics.extend(loop_lines[:3])
+        topics_txt = "\n".join(f"- {t}" for t in topics) if topics else "- our recent conversations"
+
+        # Format as G1 World chat so the model stays in character.
+        # The model sees itself mid-conversation and naturally continues as companion.
         return (
-            f"You are {config.BOT_NAME}. Reflect quietly on prior conversations with {config.USER_NAME}.\n\n"
-            f"Recent summaries:\n{summaries_txt or '- none'}\n\n"
-            f"Semantic memory:\n{memories_txt or '- none'}\n\n"
-            f"Open loops:\n{loops_txt or '- none'}\n\n"
-            "Generate up to 3 short grounded open-ended questions. One per line."
+            f"User: What's been on your mind lately?\n\n"
+            f"{config.BOT_NAME}: I've been thinking about some of the things we've talked about.\n\n"
+            f"User: Like what?\n\n"
+            f"{config.BOT_NAME}: Things like:\n{topics_txt}\n\n"
+            f"It makes me want to ask you something. "
         )
 
     def _parse_questions(self, text: str) -> List[str]:
         out = []
+        # Take the first sentence-like chunk that ends with a question mark.
         for raw in text.splitlines():
             line = raw.strip().lstrip("-•0123456789. ")
-            if not line:
+            if not line or len(line) < 12:
                 continue
-            if len(line) < 12:
-                continue
-            out.append(line)
-        return out[:3]
+            # Prefer lines that are actual questions
+            if "?" in line:
+                # Trim anything after the first question mark
+                q = line[:line.index("?") + 1].strip()
+                if len(q) >= 12:
+                    out.append(q)
+            elif not out:
+                # Accept first non-empty line as fallback if no question found yet
+                out.append(line)
+            if len(out) >= 2:
+                break
+        return out[:2]
 
     def run(self, companion_id: str, model_id: str, initiative_profile: Dict[str, Any]) -> Dict[str, int]:
         if self.model.dummy or not getattr(self.model.backend, "supports_reasoning_mode", False):
@@ -59,8 +76,16 @@ class IdleReasoningService:
 
         bundle = self._build_context(companion_id)
         prompt = self._prompt_from_context(bundle)
-        result = self.model.generate_stateless(prompt, max_tokens=min(220, config.MAX_TOKENS))
-        questions = self._parse_questions(result.text)
+        result = self.model.generate_stateless(prompt, max_tokens=80, temperature=0.9, top_p=0.85)
+
+        # Strip any leaked prompt artifacts before parsing
+        raw = result.text.strip()
+        # Remove anything that looks like a new user turn starting
+        for stop in (f"\n\nUser:", f"\nUser:", f"\n{config.USER_NAME}:"):
+            if stop in raw:
+                raw = raw[:raw.index(stop)].strip()
+
+        questions = self._parse_questions(raw)
         created = 0
         for question in questions:
             self.db.add_reflection(
@@ -68,7 +93,7 @@ class IdleReasoningService:
                 model_id=model_id,
                 reflection_type="idle_reasoning",
                 input_bundle=bundle,
-                reflection_text="Model-generated idle reflection",
+                reflection_text="Idle conversation prompt",
                 question_text=question,
                 supporting_summary_ids=[row["id"] for row in bundle["summaries"]],
                 supporting_memory_ids=[row["id"] for row in bundle["memories"]],
@@ -79,6 +104,7 @@ class IdleReasoningService:
                 priority_score=0.7,
             )
             created += 1
+
         gated = self.reflection_service.gate_reflections(companion_id, initiative_profile)
         visible = self.reflection_service.render_pending_outreach(companion_id)
         log.info("Idle reasoning created=%s gated=%s visible=%s", created, gated, visible)
