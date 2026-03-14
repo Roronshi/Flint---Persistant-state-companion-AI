@@ -1029,8 +1029,25 @@ async def run_lora_now():
     ok, msg = state.scheduler.pipeline.should_run()
     if not ok:
         return {"ok": False, "message": msg}
-    state.scheduler.run_now()
-    return {"ok": True, "message": "LoRA training started"}
+
+    def _progress(epoch, step, total_steps, loss):
+        state.training_progress = {
+            "epoch": epoch,
+            "step": step,
+            "total_steps": total_steps,
+            "loss": round(loss, 4),
+            "epochs": getattr(config, "LORA_EPOCHS", 1),
+        }
+
+    state.training_active = True
+    state.training_progress = {"epoch": 1, "step": 0, "total_steps": 1, "loss": 0.0, "epochs": getattr(config, "LORA_EPOCHS", 1)}
+    state.scheduler.pipeline._progress_callback = _progress
+    try:
+        state.scheduler.run_now()
+    finally:
+        state.training_active = False
+        state.scheduler.pipeline._progress_callback = None
+    return {"ok": True, "message": "LoRA training complete"}
 
 
 @app.websocket("/ws/chat")
@@ -1057,6 +1074,9 @@ async def chat_websocket(websocket: WebSocket):
                 continue
             if not state.startup_done:
                 await websocket.send_text(json.dumps({"type": "error", "message": "Model is still loading — please wait."}))
+                continue
+            if state.training_active:
+                await websocket.send_text(json.dumps({"type": "training", **state.training_progress}))
                 continue
             user_input = msg.get("content", "").strip()
             if not user_input:
