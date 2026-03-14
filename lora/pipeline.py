@@ -42,6 +42,7 @@ class LoRAPipeline:
     def __init__(self, db: ConversationDB, backend=None):
         self.db = db
         self._backend = backend
+        self._progress_callback = None
         Path(config.LORA_DIR).mkdir(parents=True, exist_ok=True)
 
     def should_run(self) -> tuple[bool, str]:
@@ -157,89 +158,52 @@ class LoRAPipeline:
 
     def _run_peft_training(self, segments: list, backend=None) -> bool:
         """
-        Fine-tune by running lora/trainer.py as a subprocess with RWKV_JIT_ON=0.
-        This lets the main process keep JIT enabled for fast inference while the
-        trainer subprocess loads the model fresh without JIT so .w is accessible.
+        Fine-tune in-process using RWKVLoRATrainer.
+        JIT is disabled globally (RWKV_JIT_ON=0) so model.w is accessible.
+        Progress reported via self._progress_callback if set.
+        Chat is blocked externally via state.training_active flag.
         """
-        import subprocess as _subprocess
-        import sys as _sys
+        from lora.trainer import RWKVLoRATrainer
 
         adapter_path = config.LORA_ADAPTER
         backup_path  = adapter_path + ".bak"
-        project_root = Path(config.BASE_DIR)
-        trainer_script = project_root / "lora" / "trainer.py"
-        venv_python = project_root / ".venv" / "bin" / "python3"
-        python_exe = str(venv_python) if venv_python.exists() else _sys.executable
 
-        # Strip .pth suffix — RWKV_x070 appends it internally
-        model_path = config.MODEL_PATH
-        if model_path.endswith(".pth"):
-            model_path = model_path[:-4]
+        if backend is None:
+            log.error("No backend provided — cannot train in-process.")
+            return False
 
-        # Back up existing adapter
         if os.path.exists(adapter_path):
             try:
                 shutil.copy2(adapter_path, backup_path)
             except Exception as e:
                 log.warning(f"Adapter backup failed (continuing): {e}")
 
-        # Write segments to a temp JSONL file
-        fd, tmpfile = tempfile.mkstemp(suffix=".jsonl")
         try:
-            os.close(fd)
-            self.write_jsonl(segments, tmpfile)
-
-            cmd = [
-                python_exe, str(trainer_script),
-                "--model",       model_path,
-                "--strategy",    config.MODEL_STRATEGY,
-                "--data",        tmpfile,
-                "--adapter_out", adapter_path,
-                "--r",           str(config.LORA_R),
-                "--alpha",       str(config.LORA_ALPHA),
-                "--lr",          str(config.LORA_LR),
-                "--epochs",      str(getattr(config, "LORA_EPOCHS", 1)),
-            ]
-            if os.path.exists(adapter_path):
-                cmd += ["--adapter_in", adapter_path]
-
-            env = os.environ.copy()
-            env["RWKV_JIT_ON"] = "0"   # must be off so model.w is accessible
-            env["RWKV_V7_ON"]  = "1"
-            env["RWKV_CUDA_ON"] = "0"
-
-            # Offload main model to CPU to free VRAM for the trainer subprocess
-            if backend is not None and hasattr(backend, "offload_to_cpu"):
-                log.info("Offloading main model to CPU to free VRAM...")
-                backend.offload_to_cpu()
-
-            log.info("Launching trainer subprocess...")
-            try:
-                result = _subprocess.run(
-                    cmd,
-                    env=env,
-                    capture_output=False,
-                    timeout=7200,
-                )
-            finally:
-                # Always reload model back to GPU
-                if backend is not None and hasattr(backend, "reload_to_gpu"):
-                    log.info("Reloading main model to GPU...")
-                    backend.reload_to_gpu()
-
-            if result.returncode != 0:
-                if os.path.exists(backup_path):
-                    shutil.copy2(backup_path, adapter_path)
-                    log.info("Restored previous adapter after failed training run.")
+            trainer = RWKVLoRATrainer(
+                backend=backend,
+                r=config.LORA_R,
+                alpha=config.LORA_ALPHA,
+                lr=config.LORA_LR,
+                epochs=getattr(config, "LORA_EPOCHS", 1),
+                device="cuda" if "cuda" in config.MODEL_STRATEGY else "cpu",
+                dropout=0.05,
+            )
+            result = trainer.train(
+                segments,
+                progress_callback=self._progress_callback,
+            )
+            if "error" in result:
+                log.error("Trainer error: %s", result["error"])
                 return False
+            trainer.save_adapter(adapter_path)
+            log.info(
+                "LoRA training complete — loss: %.4f steps: %d elapsed: %.1fs",
+                result["loss"], result["steps"], result["elapsed"],
+            )
             return True
-
-        except _subprocess.TimeoutExpired:
-            log.error("LoRA training timed out after 2 hours.")
-            return False
         except Exception as exc:
-            log.error("LoRA subprocess error: %s", exc, exc_info=True)
+            log.error("LoRA training failed: %s", exc, exc_info=True)
+            if os.path.exists(backup_path):
+                shutil.copy2(backup_path, adapter_path)
+                log.info("Restored previous adapter after training error.")
             return False
-        finally:
-            if os.path.exists(tmpfile):
-                os.unlink(tmpfile)
