@@ -1,178 +1,203 @@
 # Flint
 
-Flint is an attempt to build something that doesn't exist yet: a personal AI companion that lives on your machine, develops over time, and remains entirely yours.
+Flint is a personal AI companion that runs entirely on your own hardware. It uses RWKV — a recurrent neural network architecture — which means it carries genuine internal state between sessions rather than reconstructing context from a text log each time. That state is saved to disk when you close the chat and restored when you open it again. On top of that, nightly LoRA fine-tuning shapes the model's character from your accumulated conversations over weeks and months.
 
-Most AI assistants reset with every conversation and recall everything with perfect fidelity. Flint aims for something different — something closer to how human memory actually works. It won't remember every detail of what you said three months ago. What it aims to do instead is be gradually shaped by the sum of your shared history: the things you return to, the way you phrase things, the texture of how you relate. Less a searchable database, more a relationship that accumulates.
-
-The underlying mechanism is RWKV — a recurrent model architecture that carries genuine internal state rather than processing a context window from scratch each time. That state is saved to disk at the end of every session and restored at the start of the next. Alongside that, Flint runs nightly LoRA fine-tuning on recent conversations mixed with older ones, slowly bending the model's character over weeks and months. The goal isn't a smarter assistant. It's a companion with a developing persona.
-
-Critically, all of this is designed to run on a personal computer. RWKV models are small enough that a modern consumer GPU can run inference comfortably, and the same is true of the nightly fine-tuning — LoRA training on a modest dataset fits within the kind of hardware people actually own. No cloud compute, no rented GPU, no subscription, no CUDA toolkit. The whole system — inference, memory, training — runs on the machine on your desk.
-
-This is early and incomplete. The architecture is in place — chat, state persistence, nightly training, conversation import, web UI — but real-world validation against a live model is still ahead. Nothing here is a promise. It's a direction.
+No cloud, no subscription, no data leaving your machine. Everything — inference, memory, training — runs locally.
 
 ```bash
 git clone https://github.com/Roronshi/Flint---Persistant-state-companion-AI/
 cd Flint---Persistant-state-companion-AI
 bash install.sh
+bash start.sh
 ```
 
 ---
 
 ## How it works
 
-RWKV is an RNN with transformer-level performance but constant memory usage — unlike transformers, it pays no growing cost for longer conversations. This makes it uniquely suited for long-term companion use.
-
-The project consists of three layers operating on different timescales:
+Flint maintains memory across three layers operating on different timescales:
 
 | Layer | What it is | Timescale |
 |---|---|---|
-| **RWKV State** | Active relationship memory — what is alive right now | Per session |
-| **LoRA Adapter** | Character formation — how the model fundamentally meets you | Weeks, months |
-| **SQLite log** | Exact conversation history, searchable, yours | Forever |
+| **RWKV State** | The model's live internal state — what is active in the relationship right now | Per session |
+| **LoRA Adapter** | Character formation — fine-tuned weight deltas that accumulate your conversational history | Weeks, months |
+| **SQLite log** | Verbatim conversation history, fully searchable, never deleted | Forever |
 
-State is saved to disk at the end of every session. Next time you open the chat, the model continues exactly where it left off — not through text reconstruction but through a genuinely stored mental state. LoRA runs automatically every night (03:00) on the day's conversations mixed with older ones (replay buffer), gradually bending the base weights toward how you communicate.
+**RWKV state** is not a text summary or a retrieved memory — it is the model's actual recurrent state tensor, saved as a `.pt` file. When you start a session, the model loads that tensor and continues from it. This is categorically different from transformer-based chatbots that re-read a context window from scratch.
+
+**LoRA training** runs automatically at 03:00 each night if enough new conversations have accumulated (default threshold: 3 sessions). It mixes recent sessions with a replay buffer of older ones to prevent new training from overwriting older character formation. The updated adapter is loaded at the next session start.
+
+**Dream generation** runs during idle periods between conversations. The model generates autonomous inner monologue — opinions, curiosities, observations — using seed prompts designed to produce non-reactive thought rather than user-directed responses. These are stored as a separate reflection type and included in LoRA training data. The purpose is to prevent the model from collapsing into an echo of the user over time.
 
 ---
 
 ## Quick start
 
-### 1. Clone
+### 1. Clone and install
 
 ```bash
 git clone https://github.com/Roronshi/Flint---Persistant-state-companion-AI/
 cd Flint---Persistant-state-companion-AI
-```
-
-### 2. Install
-
-```bash
 bash install.sh
 ```
 
-The script installs all Python dependencies, creates data directories, and guides you through the model download. No CUDA toolkit or system-level ML packages required.
+The installer creates a virtual environment, installs dependencies, and sets up data directories. No CUDA toolkit or system-level ML packages required — PyTorch with CUDA runtime is sufficient.
 
-### 3. Get a model
+### 2. Get a model
 
-There are two ways to do this:
+Download an official **RWKV-7 G1** model from [HuggingFace (BlinkDL)](https://huggingface.co/BlinkDL) and place it in the `models/` directory. Alternatively, upload a model directly from the web UI after startup.
 
-1. Run `bash install.sh` and let Flint guide you toward an official **RWKV-7 G1** size.
-2. Upload your own `.pth` or `.onnx` model directly from the web UI after startup.
+**Recommended sizes:**
 
-**Recommended official G1 sizes:**
+| Size | VRAM | Notes |
+|---|---|---|
+| 0.4B | ~1 GB | CPU-capable, limited quality |
+| 1.5B | ~3 GB | Good for lightweight GPU setups |
+| 2.9B | ~6 GB | Solid mid-range option |
+| **7.2B** | **~8 GB (INT8)** | **Recommended — best local quality** |
 
-| Size | Best for |
-|---|---|
-| 0.1B | testing / very limited hardware |
-| 0.4B | lightweight laptops and CPUs |
-| 1.5B | balanced local use |
-| 2.9B | faster GPU-backed local use |
-| 7.2B | strongest local quality on high-end hardware |
+The 7.2B model with `cuda fp16i8` strategy fits comfortably on a 12 GB GPU and delivers strong conversational quality. Smaller models work on less hardware but produce noticeably simpler responses.
+
+### 3. Configure
+
+Copy `config.example.py` to `config_local.py` and set at minimum:
+
+```python
+MODEL_PATH     = "/path/to/models/rwkv7-g1e-7.2b-20260301-ctx8192.pth"
+MODEL_STRATEGY = "cuda fp16i8"   # INT8 quantisation — ~8 GB VRAM
+
+USER_NAME = "your_name"
+BOT_NAME  = "Flint"
+```
+
+Everything else has sensible defaults.
 
 ### 4. Start
 
 ```bash
-bash start.sh
+bash start.sh          # Starts backend and opens http://localhost:8000
+bash start.sh --fg     # Foreground mode (logs to stdout)
+bash stop.sh           # Stop background process
 ```
-
-Open `http://localhost:8000` in your browser.
 
 ---
 
 ## Web UI
 
-Clean, dark, fast. Tokens stream in real time. Sidebar with session statistics, full-text search across conversation history, and a manual LoRA trigger.
+Dark, fast, no frills. Chat streams token by token. The sidebar gives you:
 
-Accessible from mobile via [Tailscale](https://tailscale.com):
-
-```bash
-bash start.sh
-# Open on mobile: http://<tailscale-ip>:8000
-```
-
-**Sidebar buttons:**
-
-| Button | Function |
+| Control | Function |
 |---|---|
-| ◈ Save state | Save manually (also happens automatically every 5 turns) |
-| ⟳ Run LoRA now | Trigger training immediately without waiting until 03:00 |
-| ◌ Reset state | Start the relationship from scratch (log is preserved) |
-| Search field | Full-text search across the entire conversation history |
+| **Save state** | Save the RWKV state to disk immediately (also auto-saves every 5 turns) |
+| **Run LoRA now** | Trigger training immediately without waiting for the nightly schedule |
+| **Reset state** | Clear the RWKV state and start the relationship fresh — log is preserved |
+| **Search** | Full-text search across the entire conversation history |
+| **Backup** | Create a timestamped zip of state, adapter, and database |
+
+Accessible from mobile via [Tailscale](https://tailscale.com) — open `http://<tailscale-ip>:8000`.
 
 ---
 
-## Terminal UI
+## Configuration reference
 
-```bash
-python main.py
-```
-
-**Commands:**
-
-```
-/status       — state, LoRA version, session statistics
-/save         — save state manually
-/reset        — reset state
-/search <q>   — search conversation history
-/lora now     — run LoRA training immediately
-/lora status  — show scheduler status
-/quit         — exit and save
-```
-
----
-
-## Importing existing conversations
-
-Export your ChatGPT or Claude history and feed it in as a starting point. The more data, the stronger the LoRA starting point.
-
-```bash
-# ChatGPT (Settings → Export data → conversations.json)
-python tools/parser.py --source chatgpt --file ~/Downloads/conversations.json
-
-# Claude (Settings → Export)
-python tools/parser.py --source claude --file ~/Downloads/conversations.json
-
-# Preview without saving
-python tools/parser.py --source claude --file export.json --dry-run
-```
-
----
-
-## LoRA — automatic character formation
-
-LoRA runs automatically every night at 03:00 if there are enough new conversations (default: at least 3). You won't notice — the bot is just a little more itself the next morning.
-
-**How it works:**
-
-1. Fetches sessions not yet trained on
-2. Mixes in 30% older sessions (replay buffer — prevents new training from erasing old character)
-3. Trains LoRA adapter matrices directly in PyTorch — no CUDA toolkit, no external training framework
-4. Saves updated adapter, loaded at next session start
-
-**Configuration in `config_local.py`:**
+All settings live in `config.py` with defaults. Override in `config_local.py` — that file is `.gitignore`'d and never committed.
 
 ```python
-LORA_R          = 16      # Rank — higher = more expressive adapter
-LORA_MIN_CONVOS = 3       # Don't train on fewer sessions than this
-REPLAY_RATIO    = 0.3     # 30% old conversations in each training batch
-LORA_SCHEDULE   = "03:00" # Nightly training time
+# Model
+MODEL_PATH     = "models/rwkv7-g1e-7.2b-20260301-ctx8192.pth"
+MODEL_STRATEGY = "cuda fp16i8"   # or "cpu fp32", or "cuda fp16 *20 -> cpu fp32" (split)
+
+# Identity
+USER_NAME = "user"
+BOT_NAME  = "companion"
+
+# LoRA
+LORA_R          = 16       # Adapter rank — higher means more expressive but slower training
+LORA_MIN_CONVOS = 3        # Minimum new sessions required to trigger nightly training
+REPLAY_RATIO    = 0.3      # Fraction of training data drawn from older sessions
+LORA_SCHEDULE   = "03:00"  # Nightly training time (24h)
+
+# Dream (autonomous inner monologue)
+DREAM_RATIO            = 0.25   # Fraction of training segments that are dreams
+DREAM_MAX_TOKENS       = 150
+DREAM_TEMPERATURE      = 0.88
+DREAM_INTERVAL_SECONDS = 1800   # Generate dreams every 30 min of idle time
+
+# Generation
+MAX_TOKENS  = 500
+TEMPERATURE = 1.0
+TOP_P       = 0.85
 ```
+
+**Split strategy** — if the model doesn't fit fully in VRAM, the rwkv package supports pushing layers to CPU RAM:
+
+```python
+MODEL_STRATEGY = "cuda fp16i8 *24 -> cpu fp32"
+# First 24 layers on GPU (INT8), remaining layers on CPU RAM
+```
+
+This trades inference speed for VRAM headroom. LoRA training is unaffected — the trainer always offloads base weights to CPU RAM before training regardless of the inference strategy.
 
 ---
 
-## Decentralized setup
+## What happens over time
 
-All data is stored locally. Sync `data/states/` and `data/lora_adapters/` with e.g. Syncthing to have the same companion across multiple devices. The base model only needs to exist on the server.
+The model doesn't change in any single conversation. The changes are slow and cumulative.
+
+After enough conversations have accumulated (default: 3), the nightly training job runs. It takes recent sessions, mixes in a fraction of older ones, and trains the LoRA adapter matrices — the small sets of weight deltas applied on top of the frozen base model. The base model itself is never modified. The adapter gets incrementally closer to how you communicate, what you talk about, and how the relationship between you has developed.
+
+Dream generation runs in the background between conversations. These are autonomous thoughts the model generates without any user input — opinions, observations, things it's curious about. They're included in training to counterbalance the natural tendency of a model trained only on conversations to become a mirror of whoever it's talking to.
+
+The RWKV state carries the immediate texture of the relationship: the last things discussed, the current emotional register, unresolved threads. It is what makes the model feel continuous rather than episodic.
+
+---
+
+## Importing conversations
+
+Feed in existing chat history as a starting point. Supported formats: ChatGPT export, Claude export.
+
+```bash
+# ChatGPT — Settings → Export data → conversations.json
+python tools/parser.py --source chatgpt --file ~/Downloads/conversations.json
+
+# Claude — Settings → Export
+python tools/parser.py --source claude --file ~/Downloads/conversations.json
+
+# Preview without writing
+python tools/parser.py --source chatgpt --file export.json --dry-run
+```
+
+Imported conversations are included in the training data pool and count toward the LoRA threshold. The more history you import, the stronger the starting adapter.
+
+---
+
+## Backup
+
+Flint automatically backs up the three files that constitute the full relationship state after each training run:
+
+- RWKV state (`.pt`)
+- LoRA adapter (`.pth`)
+- SQLite database (`.db`)
+
+Backups are stored under `data/backups/` and pruned to the 7 most recent. You can also trigger a backup manually from the UI sidebar or via `POST /api/backup/run`. Individual backups are downloadable as `.zip` via `GET /api/backup/{timestamp}/download`.
+
+---
+
+## Data layout
 
 ```
-Flint/
+flint/
 ├── models/
-│   └── rwkv7-g1-2.9b.pth           # Base weights (~6GB)
+│   └── rwkv7-g1e-7.2b-20260301-ctx8192.pth   # Base weights (download separately)
 ├── data/
-│   ├── states/{name}_state.pt       # Active relationship memory (~200MB)
-│   ├── lora_adapters/current.pth    # Personal adapter
-│   └── conversations.db             # SQLite log
-└── config_local.py
+│   ├── states/{USER_NAME}_state.pt             # RWKV state — active relationship memory
+│   ├── lora_adapters/current_adapter.pth       # Personal adapter — trained character
+│   ├── conversations.db                        # SQLite log — full history
+│   └── backups/                                # Timestamped backup archives
+└── config_local.py                             # Your local settings (gitignored)
 ```
+
+To sync the same companion across multiple machines, replicate `data/states/` and `data/lora_adapters/` — e.g. via Syncthing. The base model only needs to live on the machine running inference.
 
 ---
 
@@ -181,9 +206,9 @@ Flint/
 | Component | Minimum | Recommended |
 |---|---|---|
 | Python | 3.10+ | 3.12 |
-| RAM | 16GB | 32GB+ |
-| VRAM | 8GB (fp16i8) | 12GB+ (fp16) |
-| Disk | 20GB | 50GB+ |
+| RAM | 16 GB | 32 GB+ |
+| VRAM | 4 GB (1.5B fp16) | 12 GB (7.2B INT8) |
+| Disk | 20 GB | 50 GB+ |
 | OS | Linux / macOS | Linux |
 
 No CUDA toolkit required. PyTorch with CUDA runtime is sufficient.
@@ -193,37 +218,34 @@ No CUDA toolkit required. PyTorch with CUDA runtime is sufficient.
 ## Project structure
 
 ```
-Flint/
+flint/
 ├── core/
-│   ├── model.py            # RWKV wrapper, state load/save, generation
-│   ├── session.py          # SQLite log, session management
-│   └── model_backends/     # rwkv / onnx / dummy backends
+│   ├── model.py              # CompanionModel — state load/save, generation, LoRA apply
+│   ├── session.py            # ConversationDB (SQLite), Session management
+│   └── model_backends/       # rwkv_backend, onnx_backend, dummy_backend
 ├── lora/
-│   ├── trainer.py          # LoRA training — pure PyTorch, no external deps
-│   ├── pipeline.py         # Training pipeline with replay buffer
-│   └── scheduler.py        # Nightly automatic training
+│   ├── trainer.py            # LoRA training — pure PyTorch, no external framework
+│   ├── pipeline.py           # Training pipeline — data selection, replay buffer
+│   └── scheduler.py          # Nightly scheduler daemon
 ├── services/
-│   ├── chat_service.py
-│   ├── idle_reasoning.py   # Generates conversation-keeping questions
-│   ├── reflection_service.py
-│   └── model_registry.py
-├── interface/
-│   └── terminal.py         # Terminal chat UI
+│   ├── chat_service.py       # Session lifecycle
+│   ├── reflection_service.py # Conversation summarisation and semantic indexing
+│   ├── idle_reasoning.py     # Generates proactive questions during idle time
+│   ├── dream_service.py      # Autonomous inner monologue generation
+│   ├── backup_service.py     # State/adapter/DB backup and rotation
+│   ├── model_registry.py     # Model discovery and metadata
+│   └── scheduler_service.py  # Background job runner
 ├── web/
-│   ├── server.py           # FastAPI + WebSocket backend
-│   └── static/
-│       └── index.html      # Complete web UI (single file)
+│   ├── server.py             # FastAPI app — REST + WebSocket
+│   └── static/index.html     # Web UI (single file)
 ├── tools/
-│   └── parser.py           # Conversation import (ChatGPT / Claude)
-├── models/                 # Place .pth files here
-├── data/                   # State, adapters, SQLite — created automatically
-├── config.py               # Default configuration
-├── config.example.py       # Template for your configuration
-├── main.py                 # Terminal UI entry point
-├── install.sh              # Installer script
-├── start.sh                # Start backend + open browser
-├── stop.sh                 # Stop background process
-└── requirements.txt
+│   └── parser.py             # Conversation import (ChatGPT / Claude)
+├── config.py                 # Default configuration (do not edit)
+├── config.example.py         # Template for config_local.py
+├── main.py                   # Terminal UI entry point
+├── install.sh
+├── start.sh
+└── stop.sh
 ```
 
 ---
@@ -234,4 +256,4 @@ GPLv3.0
 
 ## Beta candidate checklist
 
-See `BETA_CANDIDATE_CHECKLIST.md` for the concrete definition of what remains before Flint should be called a true beta candidate.
+See `BETA_CANDIDATE_CHECKLIST.md` for the remaining items before a formal beta release.
